@@ -7,6 +7,15 @@ Videos are auto-collected from a Telegram CHANNEL — whenever you post a
 video in that channel, the bot picks it up and adds it to its list
 automatically (bot must be an admin in the channel).
 
+FIX vs original version:
+Instead of storing only the raw `file_id` (which keeps working / keeps
+getting sent even after you delete the message from the channel), this
+version stores the channel's (chat_id, message_id) and uses
+`copy_message` to deliver videos. If the source message was deleted,
+`copy_message` raises an error — the bot catches that, removes the
+stale entry from videos.json automatically, and tries another video.
+This means deleted videos stop being sent, with no manual cleanup.
+
 Includes a tiny web server so it can run as a free Render Web Service
 (Render's free tier requires the app to bind to a port).
 
@@ -26,6 +35,7 @@ import logging
 import threading
 from flask import Flask
 from telegram import Update
+from telegram.error import TelegramError
 from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
 
 logging.basicConfig(
@@ -35,10 +45,10 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 load_dotenv()
 
-BOT_TOKEN =os.getenv("API_TOKEN")
+BOT_TOKEN = os.getenv("API_TOKEN")
 
-VIDEOS_FILE = "videos.json"        # all known video file_ids
-SENT_FILE = "sent_videos.json"     # per-user: which videos they've already received
+VIDEOS_FILE = "videos.json"        # list of {"chat_id": ..., "message_id": ...}
+SENT_FILE = "sent_videos.json"     # per-user: which video keys they've already received
 
 # --- Tiny web server (keeps Render's free Web Service alive) ---
 web_app = Flask(__name__)
@@ -70,12 +80,27 @@ def save_videos(video_list: list) -> None:
         json.dump(video_list, f)
 
 
-def add_video(file_id: str) -> None:
+def video_key(entry: dict) -> str:
+    return f'{entry["chat_id"]}:{entry["message_id"]}'
+
+
+def add_video(chat_id: int, message_id: int) -> None:
     video_list = load_videos()
-    if file_id not in video_list:
-        video_list.append(file_id)
+    entry = {"chat_id": chat_id, "message_id": message_id}
+    if entry not in video_list:
+        video_list.append(entry)
         save_videos(video_list)
         logger.info(f"Added new video. Total videos: {len(video_list)}")
+
+
+def remove_video(entry: dict) -> None:
+    """Called when a video no longer exists in the channel (deleted)."""
+    video_list = load_videos()
+    key = video_key(entry)
+    new_list = [v for v in video_list if video_key(v) != key]
+    if len(new_list) != len(video_list):
+        save_videos(new_list)
+        logger.info(f"Removed deleted video {key}. Total videos: {len(new_list)}")
 
 
 # --- Storage helpers: per-user sent history ---
@@ -99,12 +124,12 @@ def get_sent_for_user(user_id: int) -> list:
     return sent_data.get(str(user_id), [])
 
 
-def mark_sent(user_id: int, file_id: str) -> None:
+def mark_sent(user_id: int, key: str) -> None:
     sent_data = load_sent()
-    key = str(user_id)
-    sent_data.setdefault(key, [])
-    if file_id not in sent_data[key]:
-        sent_data[key].append(file_id)
+    uid = str(user_id)
+    sent_data.setdefault(uid, [])
+    if key not in sent_data[uid]:
+        sent_data[uid].append(key)
     save_sent(sent_data)
 
 
@@ -119,7 +144,7 @@ async def channel_video_handler(update: Update, context: ContextTypes.DEFAULT_TY
     """Fires whenever a video is posted in the channel the bot is admin of."""
     post = update.channel_post
     if post and post.video:
-        add_video(post.video.file_id)
+        add_video(post.chat.id, post.message_id)
 
 
 async def videos(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -133,19 +158,37 @@ async def videos(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     already_sent = get_sent_for_user(user_id)
-    available = [v for v in all_videos if v not in already_sent]
+    available = [v for v in all_videos if video_key(v) not in already_sent]
 
+    reset_note = ""
     if not available:
         # User has seen every video — reset their history and start over
         reset_sent_for_user(user_id)
         available = all_videos
-        await update.message.reply_text(
-            "You've seen all available videos! Starting over."
-        )
+        reset_note = "You've seen all available videos! Starting over.\n"
 
-    choice = random.choice(available)
-    await update.message.reply_video(video=choice)
-    mark_sent(user_id, choice)
+    random.shuffle(available)
+
+    for candidate in available:
+        try:
+            await context.bot.copy_message(
+                chat_id=user_id,
+                from_chat_id=candidate["chat_id"],
+                message_id=candidate["message_id"],
+            )
+            if reset_note:
+                await update.message.reply_text(reset_note)
+            mark_sent(user_id, video_key(candidate))
+            return
+        except TelegramError as e:
+            # Most likely reason: the message was deleted from the channel.
+            logger.warning(f"Video {video_key(candidate)} unavailable ({e}); removing.")
+            remove_video(candidate)
+            continue
+
+    await update.message.reply_text(
+        "Sorry, no videos could be sent right now. Please try again later."
+    )
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
