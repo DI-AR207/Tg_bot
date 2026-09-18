@@ -114,6 +114,9 @@ def load_sent() -> dict:
     return {}
 
 
+
+
+
 def save_sent(sent_data: dict) -> None:
     with open(SENT_FILE, "w") as f:
         json.dump(sent_data, f)
@@ -137,6 +140,22 @@ def reset_sent_for_user(user_id: int) -> None:
     sent_data = load_sent()
     sent_data[str(user_id)] = []
     save_sent(sent_data)
+
+
+
+
+
+
+
+def track_user(user_id: int) -> None:
+    user_list = load_users()
+    if user_id not in user_list:
+        user_list.append(user_id)
+        save_users(user_list)
+        logger.info(f"New user. Total users: {len(user_list)}")
+
+
+    
 
 
 # --- Handlers ---
